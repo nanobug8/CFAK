@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'C-FAK Core: Forensic Infrastructure (Specific Trigger + Role Debugging)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "c-fak"
+    AllowedPattern: "[a-z0-9-]*"
+    Description: Base name for resources (USE LOWERCASE ONLY).
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where Fargate will run (Must have internet access).
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: PUBLIC Subnet for Fargate.
+
+  DockerImageUri:
+    Type: String
+    Description: Docker Image URI (or nanobug8/cfak:latest)
+
+Resources:
+  # ==============================================================================
+  # 1. STORAGE (EVIDENCE LOCKER)
+  # ==============================================================================
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-evidence-${AWS::AccountId}-${AWS::Region}"
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToGlacier
+            Status: Enabled
+            ExpirationInDays: 365
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+
+  # ==============================================================================
+  # 2. LOGGING (CENTRAL LOG SITE)
+  # ==============================================================================
+  CFAKLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-forensic-task"
+      RetentionInDays: 14
+
+  # ==============================================================================
+  # 3. SECURITY AND ROLES
+  # ==============================================================================
+  CFAKSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Forensic Fargate Task
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow Outbound Internet Access (Required for SSM and S3)
+
+  LambdaOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrchestratorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref ForensicTaskDefinition
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: 
+                  - !GetAtt FargateTaskRole.Arn
+                  - !GetAtt FargateExecutionRole.Arn
+
+  FargateExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ForensicCapabilities
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow # Allows sending commands to the victim
+                Action: [ssm:SendCommand, ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+                Resource: "*"
+              - Effect: Allow # Allows viewing instance data and snapshots
+                Action: [ec2:DescribeInstances, ec2:DescribeTags, ec2:DescribeVolumes, ec2:CreateSnapshot, ec2:CreateTags]
+                Resource: "*"
+              - Effect: Allow # Allows Fargate to write its own logs to S3 if necessary
+                Action: s3:PutObject
+                Resource: !Sub "${EvidenceBucket.Arn}/*"
+
+  # ==============================================================================
+  # 4. ECS / FARGATE
+  # ==============================================================================
+  ForensicCluster:
+    Type: AWS::ECS::Cluster
+    Properties: { ClusterName: !Sub "${ProjectName}-Cluster" }
+
+  ForensicTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-Task"
+      Cpu: 1024
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      TaskRoleArn: !GetAtt FargateTaskRole.Arn
+      ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: "forensic-controller"
+          Image: !Ref DockerImageUri
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CFAKLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: "cfak"
+          Environment:
+            - Name: TARGET_BUCKET
+              Value: !Ref EvidenceBucket
+            - Name: PROJECT_NAME
+              Value: !Ref ProjectName
+
+  # ==============================================================================
+  # 5. ORCHESTRATION (LAMBDA)
+  # ==============================================================================
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-Launcher"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaOrchestratorRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ECS_CLUSTER_NAME: !Ref ForensicCluster
+          ECS_TASK_ARN: !Ref ForensicTaskDefinition
+          SUBNET_ID: !Ref SubnetId
+          SECURITY_GROUP_ID: !Ref CFAKSecurityGroup
+      Code:
+        ZipFile: |
+          import boto3, os, json
+          ecs = boto3.client('ecs')
+          def lambda_handler(event, context):
+              print("DEBUG EVENT:", json.dumps(event))
+              
+              # Logic to retrieve ID
+              target_id = "i-UNKNOWN"
+              try:
+                  if 'detail' in event:
+                       # Comes from EventBridge
+                       target_id = event['detail']['requestParameters']['resourcesSet']['items'][0]['resourceId']
+                  else:
+                       # Manual Test
+                       target_id = event.get('instance_id', 'i-MANUAL')
+                  print(f"[+] TARGET ID: {target_id}")
+              except Exception as e:
+                  print(f"[-] ERROR PARSE: {str(e)}")
+
+              # Launch Task
+              try:
+                  response = ecs.run_task(
+                      cluster=os.environ['ECS_CLUSTER_NAME'],
+                      launchType='FARGATE',
+                      taskDefinition=os.environ['ECS_TASK_ARN'],
+                      count=1,
+                      platformVersion='LATEST',
+                      networkConfiguration={
+                          'awsvpcConfiguration': {
+                              'subnets': [os.environ['SUBNET_ID']],
+                              'securityGroups': [os.environ['SECURITY_GROUP_ID']],
+                              'assignPublicIp': 'ENABLED'
+                          }
+                      },
+                      overrides={
+                          'containerOverrides': [{
+                              'name': 'forensic-controller', 
+                              'environment': [
+                                  {'name': 'TARGET_INSTANCE_ID', 'value': target_id},
+                                  {'name': 'OPERATION_MODE', 'value': 'LIVE_ACQUISITION'}
+                              ]
+                          }]
+                      }
+                  )
+                  print(f"[+] ECS TASK LAUNCHED: {response['tasks'][0]['taskArn']}")
+                  return {"status": "launched", "target": target_id}
+              except Exception as e:
+                  print(f"[-] ECS LAUNCH FAILED: {str(e)}")
+                  raise e
+
+  # ==============================================================================
+  # 6. TRIGGER (SPECIFIC EVENTBRIDGE) 
+  # ==============================================================================
+  ForensicTagRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Triggers C-FAK ONLY with tag Forensic=True"
+      EventPattern:
+        source: ["aws.ec2"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["ec2.amazonaws.com"]
+          eventName: ["CreateTags"]
+          requestParameters:
+            tagSet:
+              items:
+                key: ["Forensic"]   # <--- TAG NAME
+                value: ["True"]   # <--- TAG VALUE
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt OrchestratorLambda.Arn
+          Id: "ForensicLambdaTarget"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrchestratorLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ForensicTagRule.Arn
+
+  # ==============================================================================
+  # 7. VICTIM ROLE 
+  # ==============================================================================
+  ForensicVictimRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-Victim-Role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess # Permission to UPLOAD RAM
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy # Permission to UPLOAD ERROR LOGS
+
+  ForensicVictimProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-Victim-Profile"
+      Roles:
+        - !Ref ForensicVictimRole
+
+Outputs:
+  EvidenceBucketName:
+    Value: !Ref EvidenceBucket
+  LogGroupName:
+    Value: !Ref CFAKLogGroup
