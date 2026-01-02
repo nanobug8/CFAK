@@ -3,6 +3,9 @@
 # 🕵️‍♂️☁️ C-FAK: Cloud Forensic Acquisition Kit
 ### Automated Memory Acquisition & Forensic Triage for AWS EC2
 
+<img width="1104" height="699" alt="image" src="https://github.com/user-attachments/assets/b54669e8-01f4-4b20-9c2e-34d2ab114823" />
+
+
 [![AWS](https://img.shields.io/badge/AWS-CloudFormation-orange?style=for-the-badge&logo=amazon-aws)](https://aws.amazon.com/)
 [![Docker](https://img.shields.io/badge/Docker-Image-blue?style=for-the-badge&logo=docker)](https://hub.docker.com/r/nanobug8/cfak)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
